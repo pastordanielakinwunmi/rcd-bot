@@ -1,6 +1,5 @@
 import os
 import logging
-import threading
 import asyncio
 from flask import Flask
 
@@ -12,14 +11,12 @@ from telegram.ext import (
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Branding Configuration
 BRANDING = {
     "app_name": "Real Christian Dating",
     "app_short_name": "RCD",
@@ -31,11 +28,9 @@ BRANDING = {
     "geographic_scope": "Global"
 }
 
-# Environment variables
 DATABASE_URL = os.getenv('DATABASE_URL', '')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8207298018:AAHGHL0LFOc2JBSxyFCKC8hEfd3k3VSMfEs')
 
-# Conversation states
 (AGE, GENDER, LOCATION, DENOMINATION, CHURCH_ATTENDANCE, BIO, 
  PHOTO, VERIFICATION_VIDEO) = range(8)
 
@@ -284,12 +279,11 @@ class RCDTeleBot:
         await update.message.reply_text("Registration cancelled. Type /start to begin again.")
         return ConversationHandler.END
     
-    def run(self):
-        """THIS IS THE BOT RUNNING CODE"""
-        logger.info(f"Starting {BRANDING['app_name']} bot...")
-        self.application.run_polling()
+    async def run(self):
+        """Run the bot with proper async handling"""
+        await self.application.run_polling()
 
-# Flask web server for Render health checks
+# Flask web server for Render
 flask_app = Flask(__name__)
 
 @flask_app.route('/health')
@@ -300,16 +294,28 @@ def health():
 def home():
     return {'message': f'{BRANDING["app_name"]} Telegram Bot is running!'}
 
-def run_bot():
-    """Function to run the bot"""
+async def run_bot():
+    """Async function to run the bot"""
     bot = RCDTeleBot()
-    bot.run()
+    await bot.run()
 
 if __name__ == '__main__':
-    # Start Telegram bot in background thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    
-    # Start Flask web server for Render
+    # Get the PORT environment variable (Render sets this)
     port = int(os.environ.get('PORT', 10000))
-    flask_app.run(host='0.0.0.0', port=port)
+    
+    # Start Flask in a separate thread
+    import threading
+    from werkzeug.serving import make_server
+    
+    def run_flask():
+        server = make_server('0.0.0.0', port, flask_app)
+        server.serve_forever()
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Run the Telegram bot in the main thread with asyncio
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        print("Bot stopped.")
