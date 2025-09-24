@@ -3,20 +3,13 @@ services:
     name: rcd-bot
     env: python
     region: oregon
+    runtime: python:3.11.9
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn --bind 0.0.0.0:$PORT main:app"
+    startCommand: "python main.py"
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         value: "8207298018:AAHGHL0LFOc2JBSxyFCKC8hEfd3k3VSMfEs"
       - key: DATABASE_URL
         sync: false
-      - key: NOWPAYMENTS_API_KEY
-        sync: false
-      - key: NOWPAYMENTS_IPN_SECRET
-        sync: false
       - key: RENDER
         value: "true"
-    disk:
-      name: rcd-db
-      mountPath: /var/lib/postgresql
-      sizeGB: 1
