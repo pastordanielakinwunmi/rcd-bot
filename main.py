@@ -379,5 +379,10 @@ class RCDTeleBot:
         self.application.run_polling()
 
 if __name__ == '__main__':
+    # Set up basic logging
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    
+    # Run the bot
     bot = RCDTeleBot()
     bot.run()
