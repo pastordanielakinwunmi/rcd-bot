@@ -9,7 +9,5 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         value: "8207298018:AAHGHL0LFOc2JBSxyFCKC8hEfd3k3VSMfEs"
-      - key: DATABASE_URL
-        sync: false
       - key: RENDER
         value: "true"
