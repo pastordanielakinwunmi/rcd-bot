@@ -1,9 +1,8 @@
 import os
 import logging
-import asyncio
-from flask import Flask
+from flask import Flask, request, jsonify
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters, ConversationHandler
@@ -31,291 +30,234 @@ BRANDING = {
 DATABASE_URL = os.getenv('DATABASE_URL', '')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8207298018:AAHGHL0LFOc2JBSxyFCKC8hEfd3k3VSMfEs')
 
+# Conversation states
 (AGE, GENDER, LOCATION, DENOMINATION, CHURCH_ATTENDANCE, BIO, 
  PHOTO, VERIFICATION_VIDEO) = range(8)
 
-class DatabaseManager:
-    def __init__(self, database_url):
-        self.database_url = database_url
-    
-    def get_connection(self):
-        if not self.database_url:
-            raise ValueError("DATABASE_URL not set")
-        return psycopg2.connect(self.database_url, cursor_factory=RealDictCursor)
-    
-    def init_database(self):
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute('''
-                        CREATE TABLE IF NOT EXISTS users (
-                            id SERIAL PRIMARY KEY,
-                            telegram_id BIGINT UNIQUE NOT NULL,
-                            username VARCHAR(255),
-                            first_name VARCHAR(255),
-                            last_name VARCHAR(255),
-                            age INTEGER,
-                            gender VARCHAR(50),
-                            location VARCHAR(255),
-                            denomination VARCHAR(255),
-                            church_attendance VARCHAR(100),
-                            bio TEXT,
-                            profile_photo_url TEXT,
-                            verification_video_url TEXT,
-                            is_verified BOOLEAN DEFAULT FALSE,
-                            device_hash VARCHAR(255),
-                            phone_hash VARCHAR(255),
-                            is_banned BOOLEAN DEFAULT FALSE,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    ''')
-                    
-                    cur.execute('''
-                        CREATE TABLE IF NOT EXISTS wallets (
-                            id SERIAL PRIMARY KEY,
-                            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                            usdt_balance DECIMAL(15,8) DEFAULT 0.00000000,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    ''')
-                    conn.commit()
-        except Exception as e:
-            logger.error(f"Database error: {e}")
+# Global bot application
+bot_app = None
 
-class RCDTeleBot:
-    def __init__(self):
-        self.db = DatabaseManager(DATABASE_URL)
-        self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        self.db.init_database()
-        self.setup_handlers()
-    
-    def setup_handlers(self):
-        self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("help", self.help_command))
+def init_database():
+    """Initialize database tables"""
+    if not DATABASE_URL:
+        logger.error("DATABASE_URL not set")
+        return False
         
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('register', self.register_start)],
-            states={
-                AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.age)],
-                GENDER: [CallbackQueryHandler(self.gender_callback)],
-                LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.location)],
-                DENOMINATION: [CallbackQueryHandler(self.denomination_callback)],
-                CHURCH_ATTENDANCE: [CallbackQueryHandler(self.church_attendance_callback)],
-                BIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.bio)],
-                PHOTO: [MessageHandler(filters.PHOTO, self.photo)],
-                VERIFICATION_VIDEO: [MessageHandler(filters.VIDEO, self.verification_video)]
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(conv_handler)
-        self.application.add_handler(CallbackQueryHandler(self.button_handler))
-    
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("✨ Create Profile", callback_data='register_start')],
-            [InlineKeyboardButton("💎 Premium Plans", callback_data='premium_info')],
-            [InlineKeyboardButton("📖 Help & Support", callback_data='help')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        welcome_text = f"""
-        {BRANDING['welcome_message']}
-        
-        📱 **App**: {BRANDING['app_name']}
-        ⛪ **Focus**: Strictly Christian Only
-        🌍 **Scope**: {BRANDING['geographic_scope']}
-        👥 **Age Range**: {BRANDING['age_range']}
-        """
-        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    async def register_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        await query.message.reply_text("Please enter your age (18-75):")
-        return AGE
-    
-    async def age(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            age = int(update.message.text)
-            if age < 18 or age > 75:
-                await update.message.reply_text("Age must be between 18-75. Please enter again:")
-                return AGE
-            context.user_data['age'] = age
-            keyboard = [
-                [InlineKeyboardButton("Male", callback_data='gender_male')],
-                [InlineKeyboardButton("Female", callback_data='gender_female')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text("Select your gender:", reply_markup=reply_markup)
-            return GENDER
-        except ValueError:
-            await update.message.reply_text("Please enter a valid number:")
-            return AGE
-    
-    async def gender_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        gender = query.data.split('_')[1]
-        context.user_data['gender'] = gender.capitalize()
-        await query.message.reply_text("Please enter your location (city, country):")
-        return LOCATION
-    
-    async def location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        location = update.message.text
-        context.user_data['location'] = location
-        denominations = ["Catholic", "Baptist", "Methodist", "Lutheran", "Presbyterian", "Pentecostal", "Orthodox", "Non-denominational", "Other"]
-        keyboard = []
-        for i in range(0, len(denominations), 2):
-            row = []
-            for j in range(2):
-                if i + j < len(denominations):
-                    row.append(InlineKeyboardButton(denominations[i + j], callback_data=f'denom_{denominations[i + j]}'))
-            keyboard.append(row)
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("Select your denomination:", reply_markup=reply_markup)
-        return DENOMINATION
-    
-    async def denomination_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        denomination = query.data.split('_', 1)[1]
-        context.user_data['denomination'] = denomination
-        attendance_options = ["Weekly", "Monthly", "Occasionally", "Seeking"]
-        keyboard = [[InlineKeyboardButton(opt, callback_data=f'attend_{opt}')] for opt in attendance_options]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text("How often do you attend church?", reply_markup=reply_markup)
-        return CHURCH_ATTENDANCE
-    
-    async def church_attendance_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        attendance = query.data.split('_', 1)[1]
-        context.user_data['church_attendance'] = attendance
-        await query.message.reply_text("Tell us about yourself (bio):")
-        return BIO
-    
-    async def bio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        bio = update.message.text
-        context.user_data['bio'] = bio[:500]
-        await update.message.reply_text("Please upload a profile photo:")
-        return PHOTO
-    
-    async def photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        photo = update.message.photo[-1]
-        context.user_data['photo_file_id'] = photo.file_id
-        await update.message.reply_text("For security verification, please record a short video (5-10 seconds) saying: 'I seek God's will in love and relationships.'")
-        return VERIFICATION_VIDEO
-    
-    async def verification_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        video = update.message.video
-        context.user_data['video_file_id'] = video.file_id
-        await update.message.reply_text("✅ Profile created successfully!\n\nYour verification video will be reviewed by our team. You'll receive a notification when verified.\n\nIn the meantime, you can browse profiles and send likes!")
-        return ConversationHandler.END
-    
-    async def premium_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        keyboard = [
-            [InlineKeyboardButton("🥇 Gold - 15 USDT/month", callback_data='premium_gold')],
-            [InlineKeyboardButton("🏆 Platinum - 30 USDT/month", callback_data='premium_platinum')],
-            [InlineKeyboardButton("⬅️ Back", callback_data='start_menu')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        premium_text = f"""
-        💎 **{BRANDING['app_name']} Premium Plans**
-        
-        **🥇 Gold Tier - 15 USDT/month**
-        • Unlimited likes & matches
-        • See who liked you
-        • Video & voice calls
-        • Faith-based group access
-        • Daily devotion matches
-        
-        **🏆 Platinum Tier - 30 USDT/month**
-        • All Gold features
-        • Exclusive event invites
-        • Background check discount
-        • Priority support
-        • Enhanced profile visibility
-        """
-        await query.message.edit_text(premium_text, reply_markup=reply_markup, parse_mode='Markdown')
-    
-    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        data = query.data
-        if data == 'register_start':
-            await query.answer()
-            await query.message.reply_text("Please enter your age (18-75):")
-            return AGE
-        elif data == 'premium_info':
-            return await self.premium_info(update, context)
-        elif data == 'start_menu':
-            return await self.start(update, context)
-        elif data.startswith('gender_'):
-            return await self.gender_callback(update, context)
-        elif data.startswith('denom_'):
-            return await self.denomination_callback(update, context)
-        elif data.startswith('attend_'):
-            return await self.church_attendance_callback(update, context)
-        else:
-            await query.answer("Feature coming soon!")
-    
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_text = f"""
-        🆘 **{BRANDING['app_name']} Help Center**
-        
-        **Getting Started:**
-        /start - Begin your journey
-        /register - Create your profile
-        
-        **Support:**
-        Contact: {BRANDING['support_contact']}
-        Age Range: {BRANDING['age_range']}
-        Scope: {BRANDING['geographic_scope']}
-        """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Registration cancelled. Type /start to begin again.")
-        return ConversationHandler.END
-    
-    async def run(self):
-        """Run the bot with proper async handling"""
-        await self.application.run_polling()
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        with conn.cursor() as cur:
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id BIGINT UNIQUE NOT NULL,
+                    username VARCHAR(255),
+                    first_name VARCHAR(255),
+                    last_name VARCHAR(255),
+                    age INTEGER,
+                    gender VARCHAR(50),
+                    location VARCHAR(255),
+                    denomination VARCHAR(255),
+                    church_attendance VARCHAR(100),
+                    bio TEXT,
+                    profile_photo_url TEXT,
+                    verification_video_url TEXT,
+                    is_verified BOOLEAN DEFAULT FALSE,
+                    device_hash VARCHAR(255),
+                    phone_hash VARCHAR(255),
+                    is_banned BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    usdt_balance DECIMAL(15,8) DEFAULT 0.00000000,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+        return False
 
-# Flask web server for Render
-flask_app = Flask(__name__)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    keyboard = [
+        [InlineKeyboardButton("✨ Create Profile", callback_data='register_start')],
+        [InlineKeyboardButton("💎 Premium Plans", callback_data='premium_info')],
+        [InlineKeyboardButton("📖 Help & Support", callback_data='help')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_text = f"""
+    {BRANDING['welcome_message']}
+    
+    📱 **App**: {BRANDING['app_name']}
+    ⛪ **Focus**: Strictly Christian Only
+    🌍 **Scope**: {BRANDING['geographic_scope']}
+    👥 **Age Range**: {BRANDING['age_range']}
+    """
+    
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-@flask_app.route('/health')
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    help_text = f"""
+    🆘 **{BRANDING['app_name']} Help Center**
+    
+    **Getting Started:**
+    /start - Begin your journey
+    /register - Create your profile
+    
+    **Support:**
+    Contact: {BRANDING['support_contact']}
+    Age Range: {BRANDING['age_range']}
+    Scope: {BRANDING['geographic_scope']}
+    """
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def premium_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show premium plans"""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton("🥇 Gold - 15 USDT/month", callback_data='premium_gold')],
+        [InlineKeyboardButton("🏆 Platinum - 30 USDT/month", callback_data='premium_platinum')],
+        [InlineKeyboardButton("⬅️ Back", callback_data='start_menu')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    premium_text = f"""
+    💎 **{BRANDING['app_name']} Premium Plans**
+    
+    **🥇 Gold Tier - 15 USDT/month**
+    • Unlimited likes & matches
+    • See who liked you
+    • Video & voice calls
+    • Faith-based group access
+    • Daily devotion matches
+    
+    **🏆 Platinum Tier - 30 USDT/month**
+    • All Gold features
+    • Exclusive event invites
+    • Background check discount
+    • Priority support
+    • Enhanced profile visibility
+    """
+    
+    await query.message.edit_text(premium_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback queries"""
+    query = update.callback_query
+    data = query.data
+    
+    if data == 'premium_info':
+        return await premium_info(update, context)
+    elif data == 'start_menu':
+        return await start(update, context)
+    else:
+        await query.answer("Feature coming soon!")
+
+def setup_bot():
+    """Initialize and setup the bot application"""
+    global bot_app
+    if bot_app is not None:
+        return bot_app
+        
+    bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add handlers
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("help", help_command))
+    bot_app.add_handler(CallbackQueryHandler(button_handler))
+    
+    return bot_app
+
+# Flask app
+app = Flask(__name__)
+
+@app.route('/health')
 def health():
+    """Health check endpoint for Render"""
     return {'status': 'healthy', 'app': BRANDING['app_name']}
 
-@flask_app.route('/')
-def home():
-    return {'message': f'{BRANDING["app_name"]} Telegram Bot is running!'}
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming Telegram updates"""
+    global bot_app
+    if bot_app is None:
+        setup_bot()
+    
+    if bot_app is None:
+        return jsonify({'error': 'Bot initialization failed'}), 500
+    
+    # Get the update from Telegram
+    json_str = request.get_data().decode('UTF-8')
+    update = Update.de_json(json_str, bot_app.bot)
+    
+    # Process the update asynchronously
+    try:
+        bot_app.update_queue.put_nowait(update)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+        return jsonify({'error': 'Failed to process update'}), 500
 
-async def run_bot():
-    """Async function to run the bot"""
-    bot = RCDTeleBot()
-    await bot.run()
+@app.route('/setwebhook')
+def set_webhook():
+    """Set the Telegram webhook (call this once after deployment)"""
+    try:
+        global bot_app
+        if bot_app is None:
+            bot_app = setup_bot()
+        
+        # Get the webhook URL
+        render_url = os.getenv('RENDER_EXTERNAL_URL', 'https://rcd-bot.onrender.com')
+        webhook_url = f"{render_url}/webhook"
+        
+        # Set webhook
+        bot_app.bot.set_webhook(url=webhook_url)
+        
+        return jsonify({
+            'status': 'webhook set successfully',
+            'webhook_url': webhook_url
+        })
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}")
+        return jsonify({'error': f'Failed to set webhook: {str(e)}'}), 500
+
+@app.route('/')
+def home():
+    """Home page"""
+    return {'message': f'{BRANDING["app_name"]} is running!'}
 
 if __name__ == '__main__':
-    # Get the PORT environment variable (Render sets this)
+    # Initialize database
+    if DATABASE_URL:
+        init_database()
+    else:
+        logger.warning("DATABASE_URL not set - database features will be disabled")
+    
+    # Get port from environment (Render sets this)
     port = int(os.environ.get('PORT', 10000))
     
-    # Start Flask in a separate thread
-    import threading
-    from werkzeug.serving import make_server
-    
-    def run_flask():
-        server = make_server('0.0.0.0', port, flask_app)
-        server.serve_forever()
-    
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Run the Telegram bot in the main thread with asyncio
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        print("Bot stopped.")
+    # Start Flask app
+    app.run(host='0.0.0.0', port=port)
