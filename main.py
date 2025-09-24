@@ -29,8 +29,8 @@ BRANDING = {
 DATABASE_URL = os.getenv('DATABASE_URL', '')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8207298018:AAHGHL0LFOc2JBSxyFCKC8hEfd3k3VSMfEs')
 
-# Global bot application
-bot_app = None
+# Initialize bot application once
+bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 def init_database():
     """Initialize database tables"""
@@ -81,16 +81,6 @@ def init_database():
         logger.error(f"Database initialization error: {e}")
         return False
 
-def get_bot_app():
-    """Get or create bot application"""
-    global bot_app
-    if bot_app is None:
-        bot_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        # Add basic handlers
-        bot_app.add_handler(CommandHandler("start", start))
-        bot_app.add_handler(CommandHandler("help", help_command))
-    return bot_app
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -134,30 +124,24 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
+# Add handlers once
+bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(CommandHandler("help", help_command))
+
 # Flask app
 app = Flask(__name__)
 
 @app.route('/health')
 def health():
-    """Health check endpoint for Render"""
     return {'status': 'healthy', 'app': BRANDING['app_name']}
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Handle incoming Telegram updates - SIMPLE VERSION"""
+    """Handle incoming Telegram updates"""
     try:
-        # Get the update from Telegram
         json_str = request.get_data().decode('UTF-8')
-        
-        # Create bot instance
-        bot_app = get_bot_app()
-        
-        # Process the update
         update = Update.de_json(json_str, bot_app.bot)
-        
-        # Run the update processing synchronously
         bot_app.update_queue.put_nowait(update)
-        
         return jsonify({'status': 'ok'})
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -165,7 +149,6 @@ def webhook():
 
 @app.route('/')
 def home():
-    """Home page"""
     return {'message': f'{BRANDING["app_name"]} is running!'}
 
 if __name__ == '__main__':
@@ -173,8 +156,6 @@ if __name__ == '__main__':
     if DATABASE_URL:
         init_database()
     
-    # Get port from environment (Render sets this)
+    # This will be handled by gunicorn in production
     port = int(os.environ.get('PORT', 10000))
-    
-    # Start Flask app
     app.run(host='0.0.0.0', port=port)
